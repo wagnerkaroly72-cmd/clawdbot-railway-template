@@ -288,11 +288,30 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
         <option value="openclaw.logs.tail">openclaw logs --tail N</option>
         <option value="openclaw.config.get">openclaw config get &lt;path&gt;</option>
         <option value="openclaw.version">openclaw --version</option>
+        <option value="openclaw.auth.status">openclaw auth status</option>
+        <option value="openclaw.auth.refresh">openclaw auth refresh (re-auth / subscription change)</option>
       </select>
       <input id="consoleArg" placeholder="Optional arg (e.g. 200, gateway.port)" style="flex: 1" />
       <button id="consoleRun" style="background:#0f172a">Run</button>
     </div>
     <pre id="consoleOut" style="white-space:pre-wrap"></pre>
+  </div>
+
+  <div class="card">
+    <h2>VS Code integration &amp; subscription refresh</h2>
+    <p class="muted">
+      If you use <strong>GitHub Copilot</strong> and have recently upgraded from the 30-day free trial to a paid subscription,
+      VS Code may still show the free tier until the credentials are refreshed.
+      Use the button below to force a credential refresh and restart the gateway so the new subscription takes effect immediately.
+    </p>
+    <p class="muted">
+      <strong>Steps to connect VS Code to OpenClaw:</strong><br/>
+      1. Complete setup above using the <em>Copilot → GitHub Copilot</em> or <em>VS Code Copilot</em> auth option.<br/>
+      2. In VS Code, open <strong>Settings</strong> and set <code>github.copilot.advanced.authProvider</code> to <code id="gatewayUrlHint">(your OpenClaw gateway URL)</code>.<br/>
+      3. If your subscription has changed (free trial → paid), click <strong>Refresh subscription</strong> below — this re-authenticates and restarts the gateway.
+    </p>
+    <button id="authRefresh" style="background:#0369a1">Refresh subscription / Re-authenticate</button>
+    <pre id="authRefreshOut" style="white-space:pre-wrap"></pre>
   </div>
 
   <div class="card">
@@ -407,9 +426,10 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
     { value: "qwen", label: "Qwen", hint: "OAuth", options: [
       { value: "qwen-portal", label: "Qwen OAuth" }
     ]},
-    { value: "copilot", label: "Copilot", hint: "GitHub + local proxy", options: [
+    { value: "copilot", label: "Copilot", hint: "GitHub + local proxy + VS Code", options: [
       { value: "github-copilot", label: "GitHub Copilot (GitHub device login)" },
-      { value: "copilot-proxy", label: "Copilot Proxy (local)" }
+      { value: "copilot-proxy", label: "Copilot Proxy (local)" },
+      { value: "vscode-copilot", label: "VS Code Copilot (re-authenticate after subscription change)" }
     ]},
     { value: "synthetic", label: "Synthetic", hint: "Anthropic-compatible (multi-model)", options: [
       { value: "synthetic-api-key", label: "Synthetic API key" }
@@ -478,6 +498,13 @@ function buildOnboardArgs(payload) {
     if (payload.authChoice === "token" && secret) {
       // This is the Anthropics setup-token flow.
       args.push("--token-provider", "anthropic", "--token", secret);
+    }
+
+    if (payload.authChoice === "vscode-copilot") {
+      // VS Code Copilot uses the same GitHub device login as github-copilot but also
+      // flags that this is for VS Code integration, prompting a full re-authentication
+      // so any subscription change (e.g. free trial → paid) takes effect immediately.
+      args.push("--force-reauth");
     }
   }
 
@@ -657,6 +684,19 @@ function redactSecrets(text) {
     .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
 }
 
+// Re-run the authentication flow so a subscription change (e.g. free trial → paid) is picked up.
+// Restarts the gateway afterwards so the new credentials take effect immediately.
+async function runAuthRefresh() {
+  const r = await runCmd(OPENCLAW_NODE, clawArgs(["auth", "refresh"]));
+  if (r.code === 0 && isConfigured()) {
+    await restartGateway();
+  }
+  return {
+    code: r.code,
+    output: redactSecrets(r.output) + (r.code === 0 ? "\nGateway restarted with refreshed credentials.\n" : ""),
+  };
+}
+
 const ALLOWED_CONSOLE_COMMANDS = new Set([
   // Wrapper-managed lifecycle
   "gateway.restart",
@@ -670,6 +710,10 @@ const ALLOWED_CONSOLE_COMMANDS = new Set([
   "openclaw.doctor",
   "openclaw.logs.tail",
   "openclaw.config.get",
+
+  // Auth / subscription helpers
+  "openclaw.auth.refresh",
+  "openclaw.auth.status",
 ]);
 
 app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
@@ -725,6 +769,14 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", arg]));
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
     }
+    if (cmd === "openclaw.auth.status") {
+      const r = await runCmd(OPENCLAW_NODE, clawArgs(["auth", "status"]));
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "openclaw.auth.refresh") {
+      const r = await runAuthRefresh();
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: r.output });
+    }
 
     return res.status(400).json({ ok: false, error: "Unhandled command" });
   } catch (err) {
@@ -779,6 +831,18 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   }
   const r = await runCmd(OPENCLAW_NODE, clawArgs(["pairing", "approve", String(channel), String(code)]));
   return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: r.output });
+});
+
+// Re-authenticate (subscription refresh).
+// Useful when a user upgrades from a free trial to a paid plan and the change
+// is not picked up automatically (e.g. GitHub Copilot subscription transition in VS Code).
+app.post("/setup/api/auth/refresh", requireSetupAuth, async (_req, res) => {
+  try {
+    const r = await runAuthRefresh();
+    return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: r.output });
+  } catch (err) {
+    return res.status(500).json({ ok: false, output: `Internal error: ${String(err)}` });
+  }
 });
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {

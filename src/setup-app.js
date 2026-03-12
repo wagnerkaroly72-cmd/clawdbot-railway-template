@@ -25,6 +25,10 @@
   var importRunEl = document.getElementById('importRun');
   var importOutEl = document.getElementById('importOut');
 
+  // Auth refresh (subscription change)
+  var authRefreshBtn = document.getElementById('authRefresh');
+  var authRefreshOutEl = document.getElementById('authRefreshOut');
+
   function setStatus(s) {
     statusEl.textContent = s;
   }
@@ -209,6 +213,31 @@
   }
 
   if (importRunEl) importRunEl.onclick = runImport;
+
+  // Auth refresh / subscription change handler
+  if (authRefreshBtn) {
+    // Populate the gateway URL hint with the current origin so users know what to put in VS Code settings.
+    var gatewayUrlHintEl = document.getElementById('gatewayUrlHint');
+    if (gatewayUrlHintEl) {
+      gatewayUrlHintEl.textContent = window.location.origin;
+    }
+
+    authRefreshBtn.onclick = function () {
+      if (!confirm('Re-authenticate now? This runs "openclaw auth refresh" and restarts the gateway so the new subscription takes effect.')) return;
+      if (authRefreshOutEl) authRefreshOutEl.textContent = 'Refreshing credentials...\n';
+      fetch('/setup/api/auth/refresh', {
+        method: 'POST',
+        credentials: 'same-origin'
+      }).then(function (res) {
+        return res.json();
+      }).then(function (j) {
+        if (authRefreshOutEl) authRefreshOutEl.textContent = (j.output || JSON.stringify(j, null, 2));
+        return refreshStatus();
+      }).catch(function (e) {
+        if (authRefreshOutEl) authRefreshOutEl.textContent += '\nError: ' + String(e) + '\n';
+      });
+    };
+  }
 
   // Pairing approve helper
   var pairingBtn = document.getElementById('pairingApprove');
